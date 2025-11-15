@@ -1,0 +1,11 @@
+# Do not pin dependencies.
+Cargo.lock
+
+# Do not check in build artifacts.
+/target
+
+# Do not check in proptest artifacts.
+/proptest-regressions
+
+# Do not check in coverage info.
+lcov.info

@@ -1,0 +1,18 @@
+[package]
+name = "journal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+monoio = "0.2"
+thiserror = "2.0"
+
+[dev-dependencies]
+assert2 = "0.3"
+proptest = "1.9"
+tempfile = "3.23"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(coverage,coverage_nightly)',
+] }
