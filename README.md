@@ -9,7 +9,7 @@
 [build-url]: https://github.com/sandesh-sanjeev/journal/actions/workflows/ci.yml
 
 [doc-img]: https://img.shields.io/badge/crate-doc-green?style=flat
-[doc-url]: https://sandesh-sanjeev.github.io/journal/journal/index.html
+[doc-url]: https://sandesh-sanjeev.github.io/Journal/journal/index.html
 
 [cov-img]: https://coveralls.io/repos/github/sandesh-sanjeev/journal/badge.svg?branch=master
 [cov-url]: https://coveralls.io/github/sandesh-sanjeev/journal?branch=master
