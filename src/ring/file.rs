@@ -1,24 +1,19 @@
 //! Append only file for persistent storage.
 
-use monoio::fs::{File, OpenOptions};
+use crate::{BufError, BufResult};
+use monoio::{
+    buf::{IoBuf, IoBufMut},
+    fs::{File, OpenOptions},
+};
 use std::{
     cell::Cell,
     io::{Error, Result},
     path::{Path, PathBuf},
 };
-use thiserror::Error;
-
-/// Result returned from file interactions.
-pub type BufResult<T> = std::result::Result<T, BufError>;
-
-/// Different types of errors that can occur when sharing buffers.
-#[derive(Debug, Error)]
-#[error("I/O error: {1:?}")]
-pub struct BufError(Error, Vec<u8>);
 
 /// An asynchronous append only file.
 #[derive(Debug)]
-pub struct AoFile {
+pub(super) struct SegFile {
     // Current known size of the file.
     len: Cell<u64>,
 
@@ -29,7 +24,7 @@ pub struct AoFile {
     path: PathBuf,
 }
 
-impl AoFile {
+impl SegFile {
     /// Create a new file on disk.
     ///
     /// Returns an error if file already exists at path.
@@ -37,7 +32,7 @@ impl AoFile {
     /// # Arguments
     ///
     /// * `path` - Path to the file on disk.
-    pub async fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub(super) async fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         // Create a new file asserting that one doesn't already exist.
         let file = OpenOptions::new()
             .create_new(true)
@@ -61,7 +56,7 @@ impl AoFile {
     /// # Arguments
     ///
     /// * `path` - Path to the file on disk.
-    pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub(super) async fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         // Create a new file asserting that one doesn't already exist.
         let file = OpenOptions::new()
             .create(false)
@@ -81,8 +76,13 @@ impl AoFile {
         })
     }
 
+    /// Current size of the file.
+    pub(super) fn size(&self) -> u64 {
+        self.len.get()
+    }
+
     /// Path to the file on disk.
-    pub fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -96,9 +96,13 @@ impl AoFile {
     /// # Arguments
     ///
     /// * `src` - Bytes to append to file.
-    pub async fn append(&self, src: Vec<u8>) -> BufResult<Vec<u8>> {
+    pub(super) async fn append<T>(&self, src: T) -> BufResult<T, Error>
+    where
+        T: IoBuf,
+    {
         // Return early if there is nothing to append.
-        if src.is_empty() {
+        let src_len = src.bytes_init();
+        if src_len == 0 {
             return Ok(src);
         }
 
@@ -113,7 +117,7 @@ impl AoFile {
 
         // Update state and return.
         // It's probably impossible to reach u64::MAX.
-        self.len.set(pos + src.len() as u64);
+        self.len.set(pos + src_len as u64);
         Ok(src)
     }
 
@@ -121,14 +125,19 @@ impl AoFile {
     ///
     /// It is not an error for file to return lesser than requested number of bytes,
     /// even if those bytes exist in file. Attempting to start read beyond the current
-    /// known end of the file is a no-op. However an attempt will be made to read any
+    /// known end of the file is a no-op. However an attempt will be made to read as
     /// many bytes as the buffer has capacity for.
+    ///
+    /// If this method ends with an error, contents of the buffer are undefined.
     ///
     /// # Arguments
     ///
     /// * `offset` - Offset to begin read.
     /// * `dst` - Destination buffer to write bytes read from file.
-    pub async fn read_at(&self, offset: u64, dst: Vec<u8>) -> BufResult<(usize, Vec<u8>)> {
+    pub(super) async fn read_at<T>(&self, offset: u64, dst: T) -> BufResult<(usize, T), Error>
+    where
+        T: IoBuf + IoBufMut,
+    {
         // Check how many bytes can be safely read from the file.
         // Safely as in write known to have completed successfully.
         let file_len = self.len.get();
@@ -136,18 +145,21 @@ impl AoFile {
         let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
 
         // Return early if there is nothing to read.
-        let to_read = std::cmp::min(remaining, dst.len());
+        let src_len = dst.bytes_init();
+        let to_read = std::cmp::min(remaining, src_len);
         if to_read == 0 {
             return Ok((0, dst));
         }
 
         // Attempt to read from the file.
-        let (result, dst) = self.file.read_at(dst, offset).await;
+        // We only want to read upto to_read, so need to create a subslice of buffer.
+        let slice_mut = dst.slice_mut(..remaining);
+        let (result, dst) = self.file.read_at(slice_mut, offset).await;
 
         // Return results from the read.
         match result {
-            Err(error) => Err(BufError(error, dst)),
-            Ok(read) => Ok((read, dst)),
+            Err(error) => Err(BufError(error, (0, dst.into_inner()))),
+            Ok(read) => Ok((read, dst.into_inner())),
         }
     }
 
@@ -155,14 +167,14 @@ impl AoFile {
     ///
     /// If successful, guarantees that any intermediate buffers are flushed
     /// and bytes are durably stored on disk.
-    pub async fn sync(&self) -> Result<()> {
-        self.file.sync_data().await
+    pub(super) async fn sync(&self) -> Result<()> {
+        self.file.sync_all().await
     }
 
     /// Gracefully close the file.
     ///
     /// If successful, changes file changes are guaranteed to be durably stored on disk.
-    pub async fn close(self) -> Result<()> {
+    pub(super) async fn close(self) -> Result<()> {
         self.sync().await?;
         self.file.close().await
     }
@@ -173,11 +185,16 @@ impl AoFile {
 mod tests {
     use super::*;
     use assert2::{check, let_assert};
-    use monoio::IoUringDriver;
     use proptest::collection::vec;
     use proptest::prelude::*;
     use std::io::ErrorKind;
     use tempfile::tempdir;
+
+    #[cfg(not(target_os = "linux"))]
+    use monoio::LegacyDriver as IoDriver;
+
+    #[cfg(target_os = "linux")]
+    use monoio::IoUringDriver as IoDriver;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
@@ -185,12 +202,12 @@ mod tests {
         #[test]
         fn read_after_append(bufs in arb_append_bufs()) {
             let temp_dir = tempdir()?;
-            let mut runtime = monoio::RuntimeBuilder::<IoUringDriver>::new().enable_all().build()?;
+            let mut runtime = monoio::RuntimeBuilder::<IoDriver>::new().enable_all().build()?;
 
             runtime.block_on(async {
                 // Create file in path.
                 let path = temp_dir.path().join("test.aof");
-                let aof = AoFile::create(&path).await?;
+                let aof = SegFile::create(&path).await?;
 
                 // A re-usable buffer for reads.
                 let buf_capacity = bufs.iter().map(Vec::len).sum();
@@ -228,12 +245,12 @@ mod tests {
         #[test]
         fn read_after_append_reopen(bufs in arb_append_bufs()) {
             let temp_dir = tempdir()?;
-            let mut runtime = monoio::RuntimeBuilder::<IoUringDriver>::new().enable_all().build()?;
+            let mut runtime = monoio::RuntimeBuilder::<IoDriver>::new().enable_all().build()?;
 
             runtime.block_on(async {
                 // Create file in path.
                 let path = temp_dir.path().join("test.aof");
-                let mut aof = AoFile::create(&path).await?;
+                let mut aof = SegFile::create(&path).await?;
 
                 // A re-usable buffer for reads.
                 let buf_capacity = bufs.iter().map(Vec::len).sum();
@@ -281,11 +298,11 @@ mod tests {
         let path = temp_dir.path().join("test.aof");
 
         // Create file.
-        let aof = AoFile::create(&path).await?;
+        let aof = SegFile::create(&path).await?;
         aof.close().await?;
 
         // Create file again, should return error.
-        let_assert!(Err(error) = AoFile::create(&path).await);
+        let_assert!(Err(error) = SegFile::create(&path).await);
         check!(error.kind() == ErrorKind::AlreadyExists);
         Ok(())
     }
@@ -296,7 +313,7 @@ mod tests {
         let path = temp_dir.path().join("test.aof");
 
         // Open file without creating, should return error.
-        let_assert!(Err(error) = AoFile::open(&path).await);
+        let_assert!(Err(error) = SegFile::open(&path).await);
         check!(error.kind() == ErrorKind::NotFound);
         Ok(())
     }
@@ -305,7 +322,7 @@ mod tests {
     async fn append_error_returns_buf() -> Result<()> {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("test.aof");
-        let mut aof = AoFile::create(&path).await?;
+        let mut aof = SegFile::create(&path).await?;
 
         // Remove read permissions from file handle.
         let file = OpenOptions::new().create(false).read(true).open(aof.path()).await?;
@@ -323,7 +340,7 @@ mod tests {
     async fn read_at_error_returns_buf() -> Result<()> {
         let temp_dir = tempdir()?;
         let path = temp_dir.path().join("test.aof");
-        let mut aof = AoFile::create(&path).await?;
+        let mut aof = SegFile::create(&path).await?;
 
         // Append some bytes into the file.
         let src = Vec::from(b"batman");
@@ -334,7 +351,8 @@ mod tests {
         std::mem::replace(&mut aof.file, file).close().await?;
 
         let dst = vec![0; src.len()];
-        let_assert!(Err(BufError(_, buf)) = aof.read_at(0, dst).await);
+        let_assert!(Err(BufError(_, (read, buf))) = aof.read_at(0, dst).await);
+        check!(read == 0);
         check!(buf.len() == src.len());
 
         Ok(aof.close().await?)
@@ -352,8 +370,8 @@ mod tests {
     }
 
     /// Re-open a file.
-    async fn re_open<P: AsRef<Path>>(file: AoFile, path: P) -> Result<AoFile> {
+    async fn re_open<P: AsRef<Path>>(file: SegFile, path: P) -> Result<SegFile> {
         file.close().await?;
-        AoFile::open(path).await
+        SegFile::open(path).await
     }
 }

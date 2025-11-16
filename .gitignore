@@ -9,3 +9,6 @@ Cargo.lock
 
 # Do not check in coverage info.
 lcov.info
+
+# Random file from multipass that I need to figure out how to get rid of.
+_git2_bbcc516407e91dc4
